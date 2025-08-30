@@ -1,17 +1,15 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >
-  Generic CloudFormation template that exposes an API Gateway (POST /send)
-  to forward messages into an SQS queue, using a common prefix.
+  Event bus infrastructure - API ? SQS ? Lambda ? SNS (Layer 2)
 
 Parameters:
   ResourcePrefix:
     Type: String
     Default: accounxt-event-bus
-    Description: Prefix used to name API Gateway, SQS queue, and IAM role
+    Description: Prefix used to name API Gateway, SQS queue, Lambda, and SNS topic
 
 Resources:
   # --- API Gateway & Queues (Layer 1) ---
-
   ApiGateway:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -40,7 +38,7 @@ Resources:
   ApiGatewayRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ResourcePrefix}-role"
+      RoleName: !Sub "${ResourcePrefix}-api-role"
       AssumeRolePolicyDocument:
         Version: 2012-10-17
         Statement:
@@ -84,35 +82,6 @@ Resources:
             method.response.header.Access-Control-Allow-Origin: true
           ResponseModels:
             application/json: Empty
-        - StatusCode: 400
-          ResponseModels:
-            application/json: Empty
-
-  ApiGatewayMethodOptions:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref ApiGateway
-      ResourceId: !Ref ApiGatewayResource
-      HttpMethod: OPTIONS
-      AuthorizationType: NONE
-      Integration:
-        Type: MOCK
-        RequestTemplates:
-          application/json: '{"statusCode": 200}'
-        IntegrationResponses:
-          - StatusCode: 200
-            ResponseParameters:
-              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
-              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
-              method.response.header.Access-Control-Allow-Origin: "'*'"
-            ResponseTemplates:
-              application/json: "{}"
-      MethodResponses:
-        - StatusCode: 200
-          ResponseParameters:
-            method.response.header.Access-Control-Allow-Headers: true
-            method.response.header.Access-Control-Allow-Methods: true
-            method.response.header.Access-Control-Allow-Origin: true
 
   ApiGatewayDeployment:
     Type: AWS::ApiGateway::Deployment
@@ -121,13 +90,85 @@ Resources:
       StageName: prod
     DependsOn:
       - ApiGatewayMethodSend
-      - ApiGatewayMethodOptions
+
+  # --- SNS Topic ---
+  EventBusTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-topic"
+
+  # --- Lambda Main ---
+  EventBusLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-main"
+      RetentionInDays: 14
+
+  EventBusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSQSSNSPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SqsQueue.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref EventBusTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-main:*"
+
+  EventBusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-main"
+      Handler: index.lambda_handler
+      Role: !GetAtt EventBusLambdaRole.Arn
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json, boto3, os
+          sns = boto3.client("sns")
+
+          def lambda_handler(event, context):
+              print("EVENT:", json.dumps(event))
+              topic_arn = os.environ["TOPIC_ARN"]
+              for record in event.get("Records", []):
+                  msg = record["body"]
+                  sns.publish(TopicArn=topic_arn, Message=msg)
+              return {"status": "ok"}
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref EventBusTopic
+
+  EventBusMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SqsQueue.Arn
+      FunctionName: !Ref EventBusLambda
+      BatchSize: 10
+      Enabled: true
 
 Outputs:
-  ApiGatewayId:
-    Description: ID of the created API Gateway
-    Value: !Ref ApiGateway
-
   ApiInvokeUrl:
     Description: Invoke URL for the API Gateway
     Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/send"
@@ -136,10 +177,10 @@ Outputs:
     Description: URL of the created SQS queue
     Value: !Ref SqsQueue
 
-  SqsQueueArn:
-    Description: ARN of the created SQS queue
-    Value: !GetAtt SqsQueue.Arn
+  EventBusTopicArn:
+    Description: ARN of the SNS topic
+    Value: !Ref EventBusTopic
 
-  ApiGatewayRoleArn:
-    Description: ARN of the IAM role used by API Gateway
-    Value: !GetAtt ApiGatewayRole.Arn
+  EventBusLambdaArn:
+    Description: ARN of the main Lambda
+    Value: !GetAtt EventBusLambda.Arn
