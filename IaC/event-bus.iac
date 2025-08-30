@@ -1,6 +1,6 @@
 ‌AWSTemplateFormatVersion: 2010-09-09
-Description: |
-  Event bus infrastructure - API ? SQS ? Lambda ? SNS ? Subscriber SQS ? Subscriber Lambda (Layer 3)
+Description: |Event bus infrastructure - API ? SQS ? Lambda ? SNS ? Subscriber SQS ? Subscriber Lambda (Layer 3)
+  
 
 Parameters:
   ResourcePrefix:
