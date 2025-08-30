@@ -1,29 +1,29 @@
-AWSTemplateFormatVersion: 2010-09-09
-Description: >
-  Event bus infrastructure - API ? SQS ? Lambda ? SNS (Layer 2)
+‌AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Event bus infrastructure - API ? SQS ? Lambda ? SNS ? Subscriber SQS ? Subscriber Lambda (Layer 3)
 
 Parameters:
   ResourcePrefix:
     Type: String
     Default: accounxt-event-bus
-    Description: Prefix used to name API Gateway, SQS queue, Lambda, and SNS topic
+    Description: Prefix used to name resources in the event bus
 
 Resources:
   # --- API Gateway & Queues (Layer 1) ---
   ApiGateway:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: !Sub "${ResourcePrefix}-api"
+      Name: !Sub ${ResourcePrefix}-api
 
   DeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${ResourcePrefix}-dlq"
+      QueueName: !Sub ${ResourcePrefix}-dlq
 
   SqsQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${ResourcePrefix}-sqs"
+      QueueName: !Sub ${ResourcePrefix}-sqs
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
         maxReceiveCount: 5
@@ -38,7 +38,7 @@ Resources:
   ApiGatewayRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ResourcePrefix}-api-role"
+      RoleName: !Sub ${ResourcePrefix}-api-role
       AssumeRolePolicyDocument:
         Version: 2012-10-17
         Statement:
@@ -68,14 +68,14 @@ Resources:
         Uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${ResourcePrefix}-sqs
         Credentials: !GetAtt ApiGatewayRole.Arn
         RequestParameters:
-          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+          integration.request.header.Content-Type: '''application/x-www-form-urlencoded'''
         RequestTemplates:
           application/json: |
             Action=SendMessage&MessageBody=$util.urlEncode($input.body)
         IntegrationResponses:
           - StatusCode: 200
             ResponseParameters:
-              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Origin: '''*'''
       MethodResponses:
         - StatusCode: 200
           ResponseParameters:
@@ -91,23 +91,23 @@ Resources:
     DependsOn:
       - ApiGatewayMethodSend
 
-  # --- SNS Topic ---
+  # --- SNS Topic (Layer 2) ---
   EventBusTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub "${ResourcePrefix}-topic"
+      TopicName: !Sub ${ResourcePrefix}-topic
 
-  # --- Lambda Main ---
+  # --- Lambda Main (Layer 2) ---
   EventBusLambdaLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-main"
+      LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-main
       RetentionInDays: 14
 
   EventBusLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ResourcePrefix}-lambda-role"
+      RoleName: !Sub ${ResourcePrefix}-lambda-role
       AssumeRolePolicyDocument:
         Version: 2012-10-17
         Statement:
@@ -133,12 +133,12 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-main:*"
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-main:*
 
   EventBusLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${ResourcePrefix}-main"
+      FunctionName: !Sub ${ResourcePrefix}-main
       Handler: index.lambda_handler
       Role: !GetAtt EventBusLambdaRole.Arn
       Runtime: python3.12
@@ -168,13 +168,102 @@ Resources:
       BatchSize: 10
       Enabled: true
 
+  # --- Subscriber SQS (Layer 3) ---
+  SubscriberQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub accounxt-event-receptor-dummy-sqs
+
+  # --- SNS Subscription (Topic ? SQS) ---
+  SubscriberQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SubscriberQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: SQS:SendMessage
+            Resource: !GetAtt SubscriberQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref EventBusTopic
+
+  EventBusSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EventBusTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SubscriberQueue.Arn
+
+  # --- Subscriber Lambda (Layer 3) ---
+  SubscriberLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/accounxt-event-receptor-dummy
+      RetentionInDays: 14
+
+  SubscriberLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: accounxt-event-receptor-dummy-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSQSPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SubscriberQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/accounxt-event-receptor-dummy:*
+
+  SubscriberLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: accounxt-event-receptor-dummy
+      Handler: index.lambda_handler
+      Role: !GetAtt SubscriberLambdaRole.Arn
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 15
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              print("EVENT:", json.dumps(event))
+              return {"status": "received"}
+
+  SubscriberMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SubscriberQueue.Arn
+      FunctionName: !Ref SubscriberLambda
+      BatchSize: 5
+      Enabled: true
+
 Outputs:
   ApiInvokeUrl:
     Description: Invoke URL for the API Gateway
-    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/send"
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/send
 
   SqsQueueUrl:
-    Description: URL of the created SQS queue
+    Description: URL of the main SQS queue
     Value: !Ref SqsQueue
 
   EventBusTopicArn:
@@ -184,3 +273,11 @@ Outputs:
   EventBusLambdaArn:
     Description: ARN of the main Lambda
     Value: !GetAtt EventBusLambda.Arn
+
+  SubscriberQueueUrl:
+    Description: URL of the subscriber SQS queue
+    Value: !Ref SubscriberQueue
+
+  SubscriberLambdaArn:
+    Description: ARN of the subscriber Lambda
+    Value: !GetAtt SubscriberLambda.Arn
